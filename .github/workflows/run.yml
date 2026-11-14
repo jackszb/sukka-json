@@ -1,0 +1,238 @@
+
+name: Compile ruleset
+
+on:
+  push:
+  schedule:
+    - cron: "0 19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync_and_compile:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v6
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Fetch and compile sing-box rules
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # Sukka 规则镜像：优先 GitLab，失败后使用 GitHub
+          RULESET_URLS=(
+            "https://gitlab.com/SukkaW/ruleset.skk.moe.git"
+            "https://github.com/SukkaLab/ruleset.skk.moe.git"
+          )
+
+          SYNC_OK=0
+
+          rm -rf .ruleset-tmp
+          mkdir -p .ruleset-tmp
+
+          # 依次尝试两个规则源
+          for REPO in "${RULESET_URLS[@]}"; do
+
+            echo "=========================================="
+            echo "尝试规则源：${REPO}"
+
+            FETCH_OK=0
+
+            # 不再自动识别分支，直接尝试 master 和 main
+            for BRANCH in master main; do
+
+              echo "尝试获取分支：${BRANCH}"
+
+              if git fetch --no-tags --depth=1 \
+                "$REPO" "refs/heads/${BRANCH}"; then
+
+                echo "分支获取成功：${BRANCH}"
+                FETCH_OK=1
+                break
+
+              else
+                echo "分支获取失败：${BRANCH}"
+              fi
+
+            done
+
+            if [[ "$FETCH_OK" -ne 1 ]]; then
+              echo "当前规则源获取失败，尝试下一个源。"
+              continue
+            fi
+
+            # 检查 sing-box 目录
+            if ! git cat-file -e "FETCH_HEAD:sing-box" 2>/dev/null; then
+              echo "当前规则源没有 sing-box 目录。"
+              continue
+            fi
+
+            # 解压规则文件
+            rm -rf .ruleset-tmp/*
+
+            if ! git archive FETCH_HEAD sing-box |
+              tar -x -C .ruleset-tmp; then
+
+              echo "规则文件解压失败。"
+              continue
+
+            fi
+
+            # 检查三个必要目录
+            STRUCTURE_OK=1
+
+            for DIR in domainset ip non_ip; do
+
+              if [[ ! -d ".ruleset-tmp/sing-box/${DIR}" ]] ||
+                ! find ".ruleset-tmp/sing-box/${DIR}" \
+                  -type f -name "*.json" -print -quit | grep -q .; then
+
+                echo "规则目录缺失或为空：${DIR}"
+                STRUCTURE_OK=0
+                break
+
+              fi
+
+            done
+
+            if [[ "$STRUCTURE_OK" -eq 1 ]]; then
+
+              echo "规则同步成功：${REPO}"
+              SYNC_OK=1
+              break
+
+            fi
+
+            echo "规则目录不完整，尝试下一个源。"
+
+          done
+
+          # 两个规则源都失败则停止
+          if [[ "$SYNC_OK" -ne 1 ]]; then
+
+            echo "::error::所有规则源同步失败，停止发布。"
+            exit 1
+
+          fi
+
+          # 确认规则完整后替换旧目录
+          rm -rf domainset ip non_ip
+
+          cp -a .ruleset-tmp/sing-box/domainset .
+          cp -a .ruleset-tmp/sing-box/ip .
+          cp -a .ruleset-tmp/sing-box/non_ip .
+
+          rm -rf .ruleset-tmp
+
+          # 删除自定义规则文件
+          find domainset ip non_ip \
+            -type f -name "my_*.json" -delete
+
+          # 处理 JSON 规则文件
+          while IFS= read -r -d '' FILE; do
+
+            echo "处理规则文件：${FILE}"
+
+            jq '
+              walk(
+                if type == "array" then
+                  map(select(
+                    (type != "string") or
+                    ((. | test("skk\\.moe"; "i")) | not)
+                  ))
+                else
+                  .
+                end
+              )
+              |
+              walk(
+                if type == "object" then
+                  with_entries(
+                    select(.value != [] and .value != null)
+                  )
+                else
+                  .
+                end
+              )
+              |
+              .version = 5
+            ' "$FILE" > "${FILE}.tmp"
+
+            mv "${FILE}.tmp" "$FILE"
+
+            # 检查 JSON 格式
+            jq -e . "$FILE" >/dev/null
+
+          done < <(
+            find domainset ip non_ip \
+              -type f -name "*.json" -print0
+          )
+
+          # 检查处理后的规则目录
+          for DIR in domainset ip non_ip; do
+
+            if [[ ! -d "$DIR" ]] ||
+              ! find "$DIR" -type f -name "*.json" \
+                -print -quit | grep -q .; then
+
+              echo "::error::目录 ${DIR} 没有有效 JSON 文件。"
+              exit 1
+
+            fi
+
+          done
+
+          echo "=========================================="
+          echo "规则同步和处理完成。"
+
+          echo "domainset：$(find domainset -type f -name '*.json' | wc -l) 个文件"
+          echo "ip：$(find ip -type f -name '*.json' | wc -l) 个文件"
+          echo "non_ip：$(find non_ip -type f -name '*.json' | wc -l) 个文件"
+
+      - name: Commit and push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # 重新初始化 Git 仓库
+          rm -rf .git
+
+          git init -b main
+
+          git config user.name "github-actions[bot]"
+
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 提交所有规则文件
+          git add -A
+
+          git commit -m "Update sing-box rules"
+
+          # 推送到自己的 GitHub 仓库
+          git remote add origin \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          git push origin HEAD:main --force
+
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        continue-on-error: true
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          retain_days: 3
+          keep_minimum_runs: 1
